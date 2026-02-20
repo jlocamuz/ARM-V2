@@ -405,8 +405,10 @@ def main():
     df_export = forzar_extras_a_cero_si_feriado(df_export)
     # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
     df_export = aplicar_ajuste_cruce_a_feriado(df_export)
+    df_export = forzar_extras_a_cero_si_feriado_o_franco(df_export)
 
     # ahora sí, dropeo internos
+
     df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked"], errors="ignore")
 
     cols_final = [
