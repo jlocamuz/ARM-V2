@@ -414,6 +414,11 @@ def main():
         lambda r: round(max(0.0, calc_delta_hours(r["_rs"], r["_ss"], TOLERANCIA_TARDANZA_SEG)), 2),
         axis=1
     )
+# ✅ Llegada anticipada (solo informativo, NO se resta)
+    df_export["LLEGADA_ANTICIPADA"] = df_export.apply(
+        lambda r: round(max(0.0, calc_early_arrival_hours(r["_rs"], r["_ss"])), 2),
+        axis=1
+    )
 
     rename_excel = {
         "ID": "ID",
@@ -440,7 +445,7 @@ def main():
         "ID","Apellido, Nombre","Fecha","dia", "Turno",
         "Ausencia","Tardanza -", "TARDANZA", "Trabajo Insuficiente","Es Feriado","Licencia",
         "Cruce de día","Ajuste cruce→feriado",
-        "Horario obligatorio","Fichadas",
+        "Horario obligatorio","Fichadas", "LLEGADA_ANTICIPADA",
         "HORAS_FRANCO","HORAS_FERIADO","HORAS_FERIADO NOCTURNA","HORAS_FRANCO NOCTURNA","HORAS_NOCTURNA 2",
         "Observaciones",
         "Horas planificadas",
@@ -476,6 +481,7 @@ def main():
         "HORAS_EXTRA AL 100",
         "HORAS_NOCTURNA",
         "TARDANZA",
+        "LLEGADA_ANTICIPADA"
     ]
 
     for c in COLS_CERO_VACIO:
