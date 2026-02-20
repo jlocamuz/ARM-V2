@@ -15,9 +15,8 @@ from aux_functions import *
 BASE = "https://api-prod.humand.co/public/api/v1"
 AUTH = "Basic NDY4NzQwMzpseHhBWGNzdGJDVERRWEpHTFg0SU41MzJfTVpNRENSdg=="
 
-START_DATE = "2025-12-13"
-END_DATE   = "2026-01-13"
-
+START_DATE = "2026-01-22"
+END_DATE   = "2026-02-18"
 LIMIT_USERS = 50
 LIMIT_DAYS  = 500
 BATCH_SIZE  = 25
@@ -45,8 +44,8 @@ CATEGORIAS = [
     "NOCTURNA 2",
 ]
 
-# Columnas “horas” que vamos a mover en el ajuste
-HORAS_A_MOVER = [
+# Columnas “horas” que vamos a “vaciar” en el día anterior cuando movemos
+HORAS_A_VACIAR_DIA_ANTERIOR = [
     "Horas Trabajadas",
     "HORAS_REGULAR",
     "HORAS_EXTRA",
@@ -80,7 +79,7 @@ def fetch_users():
     for p in range(2, pages + 1):
         users += get(f"{BASE}/users", {"page": p, "limit": LIMIT_USERS})["users"]
 
-    user_map, legajo_map, esquema_map, turno_map, employee_ids = {}, {}, {}, {}, []
+    user_map, turno_map, employee_ids = {}, {}, []
 
     for u in users:
         if u.get("status") != "ACTIVE":
@@ -91,8 +90,6 @@ def fetch_users():
             continue
 
         employee_ids.append(emp)
-
-        # Nombre
         user_map[emp] = f"{u.get('lastName','')}, {u.get('firstName','')}"
 
         turno = ""
@@ -102,8 +99,7 @@ def fetch_users():
                 break
         turno_map[emp] = turno
 
-    return employee_ids, user_map,  turno_map
-
+    return employee_ids, user_map, turno_map
 
 # ================= CATEGORÍAS =================
 def split_categorized_hours_basic(categorized_hours, categorias_validas):
@@ -121,10 +117,6 @@ def split_categorized_hours_basic(categorized_hours, categorias_validas):
 
 # ================= CRUCE DE DÍA =================
 def calcular_cruce_dia(real_start, real_end) -> str:
-    """
-    Cruce de día = Si si hay fichadas y la fecha calendario de inicio != fin
-    (en TZ_AR). Si falta uno de los dos: No.
-    """
     if real_start is None or pd.isna(real_start) or real_end is None or pd.isna(real_end):
         return "No"
     try:
@@ -133,7 +125,7 @@ def calcular_cruce_dia(real_start, real_end) -> str:
         return "No"
 
 # ================= DAY SUMMARIES =================
-def fetch_batch(emp_ids, user_map,  turno_map):
+def fetch_batch(emp_ids, user_map, turno_map):
     rows = []
     page = 1
 
@@ -175,7 +167,7 @@ def fetch_batch(emp_ids, user_map,  turno_map):
             hours_obj = it.get("hours") or {}
             scheduled = float(hours_obj.get("scheduled") or 0)
 
-            # Horario obligatorio (primer timeslot)
+            # Horario obligatorio
             sched_start = sched_end = pd.NaT
             if slots and isinstance(slots, list):
                 d = datetime.strptime(ref, "%Y-%m-%d")
@@ -266,12 +258,7 @@ def build_df(employee_ids, user_map, turno_map):
     rows = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [
-            ex.submit(
-                fetch_batch,
-                employee_ids[i:i + BATCH_SIZE],
-                user_map,
-                turno_map
-            )
+            ex.submit(fetch_batch, employee_ids[i:i + BATCH_SIZE], user_map, turno_map)
             for i in range(0, len(employee_ids), BATCH_SIZE)
         ]
         for f in as_completed(futures):
@@ -279,29 +266,29 @@ def build_df(employee_ids, user_map, turno_map):
 
     df = pd.DataFrame(rows)
 
-    # Normalizar categorías numéricas
     for cat in CATEGORIAS:
         col = f"HORAS_{cat}"
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    # Métricas base
+    # Métrica base (la usás para mostrar, pero OJO: no la usamos para mover)
     df["HORAS_TRABAJADAS"] = (df["HORAS_REGULAR"] + df["HORAS_EXTRA"]).round(2)
 
     return df
 
-# ================= AJUSTE: CRUCE -> FERIADO =================
+# ================= AJUSTE: NORMAL -> FERIADO (CRUCE) =================
 def aplicar_ajuste_cruce_a_feriado(df_export: pd.DataFrame) -> pd.DataFrame:
     """
-    Regla:
-    - Si una fila es feriado (Es Feriado == 'Si')
-    - y la fila anterior del MISMO usuario tiene Cruce de día == 'Si'
-    - y la fila anterior NO es feriado
-    => se “mueven” horas del día anterior al feriado:
-       - se suman a Horas Trabajadas del feriado
-       - y se suman a HORAS_EXTRA AL 100 del feriado (pago 100%)
-       - y se limpian del día anterior
+    TU REGLA:
+    - Día anterior NO feriado
+    - Cruce de día = Si
+    - Día actual SÍ feriado
+    => el turno nocturno (22-06) se imputa al día actual (feriado),
+       sumando SOLO en HORAS_FERIADO del día actual.
+    => el día anterior queda en 0 (para no duplicar).
+
+    moved = horas reales del turno (por fichadas) = columna auxiliar _worked
     """
     df = df_export.copy()
 
@@ -310,111 +297,92 @@ def aplicar_ajuste_cruce_a_feriado(df_export: pd.DataFrame) -> pd.DataFrame:
 
     df["Ajuste cruce→feriado"] = "No"
 
-    # asegurar columnas numéricas
-    for c in HORAS_A_MOVER:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        else:
-            df[c] = np.nan
-
     def _is_si(v):
         return str(v).strip().lower() in ("si", "sí")
 
-    for uid, g_idx in df.groupby("ID").groups.items():
-        idxs = list(g_idx)
+    def _num(v) -> float:
+        try:
+            if v is None or pd.isna(v):
+                return 0.0
+            return float(v)
+        except Exception:
+            return 0.0
+
+    # asegurar columnas
+    if "HORAS_FERIADO" not in df.columns:
+        df["HORAS_FERIADO"] = 0.0
+    if "Horas Trabajadas" not in df.columns:
+        df["Horas Trabajadas"] = 0.0
+    if "_worked" not in df.columns:
+        df["_worked"] = 0.0
+
+    # asegurar columnas a vaciar
+    for c in HORAS_A_VACIAR_DIA_ANTERIOR:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    for uid, idxs in df.groupby("ID").groups.items():
+        idxs = list(idxs)
         for j in range(1, len(idxs)):
             i_prev = idxs[j - 1]
             i_cur  = idxs[j]
 
-            cur_fer = _is_si(df.at[i_cur, "Es Feriado"])
-            prev_fer = _is_si(df.at[i_prev, "Es Feriado"])
+            cur_fer    = _is_si(df.at[i_cur,  "Es Feriado"])
+            prev_fer   = _is_si(df.at[i_prev, "Es Feriado"])
             prev_cruce = _is_si(df.at[i_prev, "Cruce de día"])
 
+            # SOLO normal -> feriado con cruce
             if not (cur_fer and prev_cruce and not prev_fer):
                 continue
 
-            # mover horas del día anterior (todo lo trabajado)
-            moved = df.at[i_prev, "Horas Trabajadas"]
-            if pd.isna(moved) or float(moved) <= 0:
+            moved = _num(df.at[i_prev, "_worked"])
+            if moved <= 0:
                 continue
 
-            # 1) sumar a feriado
-            df.at[i_cur, "Horas Trabajadas"] = (df.at[i_cur, "Horas Trabajadas"] or 0) + moved
+            # ✅ acumular SOLO en HORAS_FERIADO del feriado
+            df.at[i_cur, "HORAS_FERIADO"] = _num(df.at[i_cur, "HORAS_FERIADO"]) + moved
 
-            # 2) pagar 100%: sumar a Extra 100
-            df.at[i_cur, "HORAS_EXTRA AL 100"] = (df.at[i_cur, "HORAS_EXTRA AL 100"] or 0) + moved
+            # ✅ para que "Horas Trabajadas" del 16 muestre las 2 acumuladas (si la columna la usás)
+            df.at[i_cur, "Horas Trabajadas"] = _num(df.at[i_cur, "Horas Trabajadas"]) + moved
 
-            # 3) reflejar en “HORAS_EXTRA” si la usás como “columna única”
-            if "HORAS_EXTRA" in df.columns:
-                df.at[i_cur, "HORAS_EXTRA"] = (df.at[i_cur, "HORAS_EXTRA"] or 0) + moved
+            # ✅ día anterior en 0 (para que no duplique)
+            for c in HORAS_A_VACIAR_DIA_ANTERIOR:
+                df.at[i_prev, c] = 0.0
 
-            # 4) limpiar del día anterior (lo mínimo: trabajadas/regulares/extra/100/50/nocturnas)
-            for c in ["Horas Trabajadas", "HORAS_REGULAR", "HORAS_EXTRA", "HORAS_EXTRA AL 50", "HORAS_EXTRA AL 100", "HORAS_NOCTURNA"]:
-                if c in df.columns:
-                    df.at[i_prev, c] = np.nan
-
-            # 5) marcar ajuste + nota
             df.at[i_cur, "Ajuste cruce→feriado"] = "Si"
-            obs = df.at[i_cur, "Observaciones"] if "Observaciones" in df.columns else ""
-            prev_date = df.at[i_prev, "Fecha"]
-            tag = f"Ajuste cruce→feriado desde {prev_date.date()}"
-            df.at[i_cur, "Observaciones"] = (str(obs) + " | " + tag).strip(" |")
 
-    # redondeo final, preservando NaN
-    for c in ["Horas Trabajadas", "HORAS_EXTRA AL 100", "HORAS_EXTRA"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
+            if "Observaciones" in df.columns:
+                obs = str(df.at[i_cur, "Observaciones"] or "").strip()
+                tag = f"Ajuste cruce→feriado desde {df.at[i_prev,'Fecha'].date()}"
+                df.at[i_cur, "Observaciones"] = (obs + " | " + tag).strip(" |")
+
+    # redondeo
+    for c in ["HORAS_FERIADO", "Horas Trabajadas"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).round(2)
 
     return df
-
-# ================= PINTAR AMARILLO EN EXCEL =================
-def pintar_filas_amarillas_por_ajuste(path_xlsx: str, sheet_name: str = "Detalle diario"):
-    wb = load_workbook(path_xlsx)
-    ws = wb[sheet_name]
-
-    # detectar fila de headers buscando “Ajuste cruce→feriado”
-    header_row = None
-    ajuste_col = None
-    for r in range(1, 30):
-        row_vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        if "Ajuste cruce→feriado" in row_vals:
-            header_row = r
-            ajuste_col = row_vals.index("Ajuste cruce→feriado") + 1
-            break
-
-    if header_row is None:
-        wb.close()
-        return
-
-    fill_yellow = PatternFill("solid", fgColor="FFF2CC")  # amarillo suave
-
-    for r in range(header_row + 1, ws.max_row + 1):
-        v = ws.cell(r, ajuste_col).value
-        if str(v).strip().lower() in ("si", "sí"):
-            for c in range(1, ws.max_column + 1):
-                ws.cell(r, c).fill = fill_yellow
-
-    wb.save(path_xlsx)
-    wb.close()
 
 # ================= MAIN =================
 def main():
     employee_ids, user_map, turno_map = fetch_users()
-
     print(f"Usuarios ACTIVE: {len(employee_ids)}")
 
     df = build_df(employee_ids, user_map, turno_map)
-
-    # ordenar
     df = df.sort_values(by=["ID", "FECHA"], ascending=[True, True]).reset_index(drop=True)
 
-    # ===== export base =====
     df_export = df.copy()
+
+    # ✅ horas reales por fichadas (esto es lo que se mueve)
+    df_export["_worked"] = df_export.apply(
+        lambda r: worked_hours_from_entries(r["_rs"], r["_re"]),
+        axis=1
+    )
+
     df_export["TARDANZA"] = df_export.apply(
         lambda r: round(max(0.0, calc_delta_hours(r["_rs"], r["_ss"], TOLERANCIA_TARDANZA_SEG)), 2),
         axis=1
     )
-# ✅ Llegada anticipada (solo informativo, NO se resta)
+
     df_export["LLEGADA_ANTICIPADA"] = df_export.apply(
         lambda r: round(max(0.0, calc_early_arrival_hours(r["_rs"], r["_ss"])), 2),
         axis=1
@@ -430,17 +398,16 @@ def main():
         "FICHADAS": "Fichadas",
         "OBSERVACIONES": "Observaciones",
         "HORAS_TRABAJADAS": "Horas Trabajadas",
-
     }
 
     df_export = df_export.rename(columns=rename_excel)
 
-    df_export = df_export.drop(columns=["_ss","_se","_rs","_re"], errors="ignore")
-
-    # ===== aplicar ajuste cruce→feriado (ANTES de exportar) =====
+    # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
     df_export = aplicar_ajuste_cruce_a_feriado(df_export)
 
-    # ===== orden final =====
+    # ahora sí, dropeo internos
+    df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked"], errors="ignore")
+
     cols_final = [
         "ID","Apellido, Nombre","Fecha","dia", "Turno",
         "Ausencia","Tardanza -", "TARDANZA", "Trabajo Insuficiente","Es Feriado","Licencia",
@@ -452,7 +419,6 @@ def main():
         "Horas Trabajadas","HORAS_REGULAR","HORAS_EXTRA","HORAS_EXTRA AL 50","HORAS_EXTRA AL 100","HORAS_NOCTURNA",
     ]
 
-
     for c in cols_final:
         if c not in df_export.columns:
             df_export[c] = np.nan
@@ -460,14 +426,13 @@ def main():
     df_export = df_export[cols_final]
     df_export["Turno"] = df_export["Turno"].fillna("")
 
-
-    # ===== export =====
     now = datetime.now()
     out = now.strftime("%Y-%m-%d_%H-%M-%S") + "_reporte_basico.xlsx"
     generated_at = now.strftime("%Y-%m-%d %H:%M")
+
     COLS_CERO_VACIO = [
         "HORAS_FRANCO",
-        "HORAS_FERIADO",
+        "HORAS_FERIADO", 
         "HORAS_FERIADO NOCTURNA",
         "HORAS_FRANCO NOCTURNA",
         "HORAS_NOCTURNA 2",
@@ -488,7 +453,7 @@ def main():
         if c in df_export.columns:
             df_export[c] = df_export[c].where(df_export[c] != 0, np.nan)
 
-    df_export["Fecha"] = df_export["Fecha"].dt.strftime("%Y-%m-%d")
+    df_export["Fecha"] = pd.to_datetime(df_export["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
 
     export_detalle_diario_excel(
         df_export=df_export,
@@ -497,15 +462,9 @@ def main():
         END_DATE=END_DATE,
         generated_at=generated_at,
         EXPORTAR_DECIMAL=True,
-        COLS_HORAS_DETALLE=[c for c in HORAS_A_MOVER if c in df_export.columns],
+        COLS_HORAS_DETALLE=[c for c in HORAS_A_VACIAR_DIA_ANTERIOR if c in df_export.columns],
     )
 
-    # (si querés seguir coloreando flags como antes, dejalo)
-    # colorear_flags_excel(path_xlsx=out, sheet_name="Detalle diario", flag_cols=FLAG_COLS)
-
-    # ✅ pintar amarillo por ajuste
-
-    
     pintar_flags_si_no(
         path_xlsx=out,
         sheet_name="Detalle diario",
@@ -514,9 +473,8 @@ def main():
             "Cruce de día","Ajuste cruce→feriado"
         ]
     )
+
     agregar_resumen_turnos(out)
-
-
     print("Excel generado:", out)
 
 if __name__ == "__main__":
