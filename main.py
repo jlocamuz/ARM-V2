@@ -404,24 +404,31 @@ def main():
     # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
     df_export = aplicar_ajuste_cruce_a_feriado(df_export)
     df_export = forzar_extras_a_cero_si_feriado_o_franco(df_export)
+
+
+    # FRANCO → EXTRA AL 100
+    df_export["HORAS_EXTRA AL 100"] = (
+        pd.to_numeric(df_export["HORAS_EXTRA AL 100"], errors="coerce").fillna(0.0) +
+        pd.to_numeric(df_export["HORAS_FRANCO"], errors="coerce").fillna(0.0)
+    ).round(2)
     # ahora sí, dropeo internos
     df_export["Horas_Netas"] = (
         df_export["HORAS_EXTRA"] - df_export["LLEGADA_ANTICIPADA"]
     ).round(2)
 
-    #df_export = restar_llegada_anticipada(df_export)
+    df_export = restar_llegada_anticipada(df_export)
 
     df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked","_worked_api"], errors="ignore")
 
     cols_final = [
         "ID",
-        #"Apellido, Nombre",
+        "Apellido, Nombre",
         "Fecha",
         "dia", 
         "Turno",
         #"Ausencia",
         #"Tardanza -", 
-        # "TARDANZA", 
+        "TARDANZA", 
         # "Trabajo Insuficiente",
         # "Es Feriado",
         # "Licencia",
@@ -429,7 +436,7 @@ def main():
         # "Ajuste cruce→feriado",
         "Observaciones",
         "Horas_Netas",
-        "HORAS_EXTRA",
+        #"HORAS_EXTRA",
         "LLEGADA_ANTICIPADA",
 
         "Horario obligatorio",
@@ -500,7 +507,8 @@ def main():
     )
      """
     #agregar_resumen_turnos(out)
-    print("Excel generado:", out)
+    agregar_resumen_general(out)
 
+    print("Excel generado:", out)
 if __name__ == "__main__":
     main()
