@@ -163,9 +163,9 @@ def fetch_batch(emp_ids, user_map, turno_map):
                 time_off_requests=tor,
                 holidays=hol
             )
-
             hours_obj = it.get("hours") or {}
             scheduled = float(hours_obj.get("scheduled") or 0)
+            worked_api = float(hours_obj.get("worked") or 0)
 
             # Horario obligatorio
             sched_start = sched_end = pd.NaT
@@ -243,6 +243,7 @@ def fetch_batch(emp_ids, user_map, turno_map):
                 "FICHADAS": fmt_range(real_start, real_end),
                 "OBSERVACIONES": build_observaciones(it),
                 "PLANIFICADAS": scheduled,
+                "_worked_api": worked_api
             }
 
             row.update(cat_hours)
@@ -273,7 +274,6 @@ def build_df(employee_ids, user_map, turno_map):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     # Métrica base (la usás para mostrar, pero OJO: no la usamos para mover)
-    df["HORAS_TRABAJADAS"] = (df["HORAS_REGULAR"] + df["HORAS_EXTRA"]).round(2)
 
     return df
 
@@ -335,7 +335,7 @@ def aplicar_ajuste_cruce_a_feriado(df_export: pd.DataFrame) -> pd.DataFrame:
             if not (cur_fer and prev_cruce and not prev_fer):
                 continue
 
-            moved = _num(df.at[i_prev, "_worked"])
+            moved = _num(df.at[i_prev, "_worked_api"])
             if moved <= 0:
                 continue
 
@@ -372,11 +372,9 @@ def main():
 
     df_export = df.copy()
 
-    # ✅ horas reales por fichadas (esto es lo que se mueve)
-    df_export["_worked"] = df_export.apply(
-        lambda r: worked_hours_from_entries(r["_rs"], r["_re"]),
-        axis=1
-    )
+    df_export["Horas Trabajadas"] = pd.to_numeric(
+        df_export["_worked_api"], errors="coerce"
+    ).fillna(0.0).round(2)
 
     df_export["TARDANZA"] = df_export.apply(
         lambda r: round(max(0.0, calc_delta_hours(r["_rs"], r["_ss"], TOLERANCIA_TARDANZA_SEG)), 2),
@@ -406,20 +404,45 @@ def main():
     # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
     df_export = aplicar_ajuste_cruce_a_feriado(df_export)
     df_export = forzar_extras_a_cero_si_feriado_o_franco(df_export)
-
     # ahora sí, dropeo internos
+    df_export["Horas_Netas"] = (
+        df_export["HORAS_EXTRA"] - df_export["LLEGADA_ANTICIPADA"]
+    ).round(2)
 
-    df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked"], errors="ignore")
+    #df_export = restar_llegada_anticipada(df_export)
+
+    df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked","_worked_api"], errors="ignore")
 
     cols_final = [
-        "ID","Apellido, Nombre","Fecha","dia", "Turno",
-        "Ausencia","Tardanza -", "TARDANZA", "Trabajo Insuficiente","Es Feriado","Licencia",
-        "Cruce de día","Ajuste cruce→feriado",
-        "Horario obligatorio","Fichadas", "LLEGADA_ANTICIPADA",
-        "HORAS_FRANCO","HORAS_FERIADO","HORAS_FERIADO NOCTURNA","HORAS_FRANCO NOCTURNA","HORAS_NOCTURNA 2",
+        "ID",
+        #"Apellido, Nombre",
+        "Fecha",
+        "dia", 
+        "Turno",
+        #"Ausencia",
+        #"Tardanza -", 
+        # "TARDANZA", 
+        # "Trabajo Insuficiente",
+        # "Es Feriado",
+        # "Licencia",
+        #"Cruce de día",
+        # "Ajuste cruce→feriado",
         "Observaciones",
+        "Horas_Netas",
+        "HORAS_EXTRA",
+        "LLEGADA_ANTICIPADA",
+
+        "Horario obligatorio",
+        "Fichadas", 
         "Horas planificadas",
-        "Horas Trabajadas","HORAS_REGULAR","HORAS_EXTRA","HORAS_EXTRA AL 50","HORAS_EXTRA AL 100","HORAS_NOCTURNA",
+        "Horas Trabajadas",
+        "HORAS_FRANCO",
+        "HORAS_FERIADO",
+        #"HORAS_FERIADO NOCTURNA",
+        # "HORAS_FRANCO NOCTURNA",
+
+        #"HORAS_REGULAR",
+    "HORAS_EXTRA AL 50","HORAS_EXTRA AL 100",#"HORAS_NOCTURNA",
     ]
 
     for c in cols_final:
@@ -428,7 +451,6 @@ def main():
 
     df_export = df_export[cols_final]
     df_export["Turno"] = df_export["Turno"].fillna("")
-
     now = datetime.now()
     out = now.strftime("%Y-%m-%d_%H-%M-%S") + "_reporte_basico.xlsx"
     generated_at = now.strftime("%Y-%m-%d %H:%M")
@@ -467,7 +489,7 @@ def main():
         EXPORTAR_DECIMAL=True,
         COLS_HORAS_DETALLE=[c for c in HORAS_A_VACIAR_DIA_ANTERIOR if c in df_export.columns],
     )
-
+    """
     pintar_flags_si_no(
         path_xlsx=out,
         sheet_name="Detalle diario",
@@ -476,8 +498,8 @@ def main():
             "Cruce de día","Ajuste cruce→feriado"
         ]
     )
-
-    agregar_resumen_turnos(out)
+     """
+    #agregar_resumen_turnos(out)
     print("Excel generado:", out)
 
 if __name__ == "__main__":
