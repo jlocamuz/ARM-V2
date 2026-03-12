@@ -15,8 +15,8 @@ from aux_functions import *
 BASE = "https://api-prod.humand.co/public/api/v1"
 AUTH = "Basic NDY4NzQwMzpseHhBWGNzdGJDVERRWEpHTFg0SU41MzJfTVpNRENSdg=="
 
-START_DATE = "2026-01-22"
-END_DATE   = "2026-02-18"
+START_DATE = "2026-01-19"
+END_DATE   = "2026-02-19"
 LIMIT_USERS = 50
 LIMIT_DAYS  = 500
 BATCH_SIZE  = 25
@@ -42,6 +42,7 @@ CATEGORIAS = [
     "FERIADO NOCTURNA",
     "FRANCO NOCTURNA",
     "NOCTURNA 2",
+    "EXTRA DOMINGO"
 ]
 
 # Columnas “horas” que vamos a “vaciar” en el día anterior cuando movemos
@@ -58,7 +59,7 @@ HORAS_A_VACIAR_DIA_ANTERIOR = [
     "HORAS_FRANCO NOCTURNA",
     "HORAS_NOCTURNA 2",
     "Extra Sábado",
-    "Extra Domingo",
+    "HORAS_EXTRA DOMINGO",
 ]
 
 # ================= SESSION =================
@@ -72,6 +73,7 @@ def get(url, params):
 
 # ================= USERS =================
 def fetch_users():
+    #first = get(f"{BASE}/users", {"page": 1, "limit": LIMIT_USERS, "search": "33932705"}) #challapa
     first = get(f"{BASE}/users", {"page": 1, "limit": LIMIT_USERS})
     pages = math.ceil(first["count"] / LIMIT_USERS)
 
@@ -101,28 +103,6 @@ def fetch_users():
 
     return employee_ids, user_map, turno_map
 
-# ================= CATEGORÍAS =================
-def split_categorized_hours_basic(categorized_hours, categorias_validas):
-    valid_upper = {c.upper(): c for c in categorias_validas}
-    out = {f"HORAS_{c}": 0.0 for c in categorias_validas}
-
-    for ch in categorized_hours or []:
-        name = (ch.get("category", {}) or {}).get("name") or ""
-        name_u = str(name).upper().strip()
-        if name_u in valid_upper:
-            label = valid_upper[name_u]
-            out[f"HORAS_{label}"] += float(ch.get("hours") or 0)
-
-    return {k: round(v, 2) for k, v in out.items()}
-
-# ================= CRUCE DE DÍA =================
-def calcular_cruce_dia(real_start, real_end) -> str:
-    if real_start is None or pd.isna(real_start) or real_end is None or pd.isna(real_end):
-        return "No"
-    try:
-        return "Si" if real_start.date() != real_end.date() else "No"
-    except Exception:
-        return "No"
 
 # ================= DAY SUMMARIES =================
 def fetch_batch(emp_ids, user_map, turno_map):
@@ -243,7 +223,8 @@ def fetch_batch(emp_ids, user_map, turno_map):
                 "FICHADAS": fmt_range(real_start, real_end),
                 "OBSERVACIONES": build_observaciones(it),
                 "PLANIFICADAS": scheduled,
-                "_worked_api": worked_api
+                "_worked_api": worked_api,
+                "_isWorkday_api": it.get("isWorkday")
             }
 
             row.update(cat_hours)
@@ -277,90 +258,6 @@ def build_df(employee_ids, user_map, turno_map):
 
     return df
 
-# ================= AJUSTE: NORMAL -> FERIADO (CRUCE) =================
-def aplicar_ajuste_cruce_a_feriado(df_export: pd.DataFrame) -> pd.DataFrame:
-    """
-    TU REGLA:
-    - Día anterior NO feriado
-    - Cruce de día = Si
-    - Día actual SÍ feriado
-    => el turno nocturno (22-06) se imputa al día actual (feriado),
-       sumando SOLO en HORAS_FERIADO del día actual.
-    => el día anterior queda en 0 (para no duplicar).
-
-    moved = horas reales del turno (por fichadas) = columna auxiliar _worked
-    """
-    df = df_export.copy()
-
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    df = df.sort_values(["ID", "Fecha"]).reset_index(drop=True)
-
-    df["Ajuste cruce→feriado"] = "No"
-
-    def _is_si(v):
-        return str(v).strip().lower() in ("si", "sí")
-
-    def _num(v) -> float:
-        try:
-            if v is None or pd.isna(v):
-                return 0.0
-            return float(v)
-        except Exception:
-            return 0.0
-
-    # asegurar columnas
-    if "HORAS_FERIADO" not in df.columns:
-        df["HORAS_FERIADO"] = 0.0
-    if "Horas Trabajadas" not in df.columns:
-        df["Horas Trabajadas"] = 0.0
-    if "_worked" not in df.columns:
-        df["_worked"] = 0.0
-
-    # asegurar columnas a vaciar
-    for c in HORAS_A_VACIAR_DIA_ANTERIOR:
-        if c not in df.columns:
-            df[c] = 0.0
-
-    for uid, idxs in df.groupby("ID").groups.items():
-        idxs = list(idxs)
-        for j in range(1, len(idxs)):
-            i_prev = idxs[j - 1]
-            i_cur  = idxs[j]
-
-            cur_fer    = _is_si(df.at[i_cur,  "Es Feriado"])
-            prev_fer   = _is_si(df.at[i_prev, "Es Feriado"])
-            prev_cruce = _is_si(df.at[i_prev, "Cruce de día"])
-
-            # SOLO normal -> feriado con cruce
-            if not (cur_fer and prev_cruce and not prev_fer):
-                continue
-
-            moved = _num(df.at[i_prev, "_worked_api"])
-            if moved <= 0:
-                continue
-
-            # ✅ acumular SOLO en HORAS_FERIADO del feriado
-            df.at[i_cur, "HORAS_FERIADO"] = _num(df.at[i_cur, "HORAS_FERIADO"]) + moved
-
-            # ✅ para que "Horas Trabajadas" del 16 muestre las 2 acumuladas (si la columna la usás)
-            df.at[i_cur, "Horas Trabajadas"] = _num(df.at[i_cur, "Horas Trabajadas"]) + moved
-
-            # ✅ día anterior en 0 (para que no duplique)
-            for c in HORAS_A_VACIAR_DIA_ANTERIOR:
-                df.at[i_prev, c] = 0.0
-
-            df.at[i_cur, "Ajuste cruce→feriado"] = "Si"
-
-            if "Observaciones" in df.columns:
-                obs = str(df.at[i_cur, "Observaciones"] or "").strip()
-                tag = f"Ajuste cruce→feriado desde {df.at[i_prev,'Fecha'].date()}"
-                df.at[i_cur, "Observaciones"] = (obs + " | " + tag).strip(" |")
-
-    # redondeo
-    for c in ["HORAS_FERIADO", "Horas Trabajadas"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).round(2)
-
-    return df
 
 # ================= MAIN =================
 def main():
@@ -371,6 +268,7 @@ def main():
     df = df.sort_values(by=["ID", "FECHA"], ascending=[True, True]).reset_index(drop=True)
 
     df_export = df.copy()
+
 
     df_export["Horas Trabajadas"] = pd.to_numeric(
         df_export["_worked_api"], errors="coerce"
@@ -386,6 +284,8 @@ def main():
         axis=1
     )
 
+    
+
     rename_excel = {
         "ID": "ID",
         "APELLIDO, NOMBRE": "Apellido, Nombre",
@@ -399,26 +299,28 @@ def main():
     }
 
     df_export = df_export.rename(columns=rename_excel)
-# 🔵 Si tiene HORAS_FERIADO, forzar extras a cero
-    df_export = forzar_extras_a_cero_si_feriado(df_export)
-    # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
-    df_export = aplicar_ajuste_cruce_a_feriado(df_export)
-    df_export = forzar_extras_a_cero_si_feriado_o_franco(df_export)
 
 
-    # FRANCO → EXTRA AL 100
-    df_export["HORAS_EXTRA AL 100"] = (
-        pd.to_numeric(df_export["HORAS_EXTRA AL 100"], errors="coerce").fillna(0.0) +
-        pd.to_numeric(df_export["HORAS_FRANCO"], errors="coerce").fillna(0.0)
-    ).round(2)
-    # ahora sí, dropeo internos
+        # ahora sí, dropeo internos
     df_export["Horas_Netas"] = (
         df_export["HORAS_EXTRA"] - df_export["LLEGADA_ANTICIPADA"]
     ).round(2)
 
     df_export = restar_llegada_anticipada(df_export)
+    # 🔵 Si tiene HORAS_FERIADO, forzar extras a cero
+    #df_export = forzar_extras_a_cero_si_feriado(df_export)
+    # ✅ aplicar ajuste ANTES de dropear _rs/_re (los necesitamos para _worked)
+    df_export = aplicar_ajuste_cruce_a_feriado(df_export)
+    #df_export = limpiar_extra_100_turno_noche(df_export)
+    #df_export = forzar_extras_a_cero_si_feriado_o_franco(df_export)
 
-    df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked","_worked_api"], errors="ignore")
+
+
+
+
+    df_export = aplicar_prioridades_horas_extra(df_export)
+
+    df_export = df_export.drop(columns=["_ss","_se","_rs","_re","_worked","_worked_api","_isWorkday_api","_regla_a_aplicada"],errors="ignore")
 
     cols_final = [
         "ID",
@@ -449,7 +351,7 @@ def main():
         # "HORAS_FRANCO NOCTURNA",
 
         #"HORAS_REGULAR",
-    "HORAS_EXTRA AL 50","HORAS_EXTRA AL 100",#"HORAS_NOCTURNA",
+    "HORAS_EXTRA AL 50","HORAS_EXTRA AL 100"#"HORAS_NOCTURNA",
     ]
 
     for c in cols_final:
@@ -478,7 +380,8 @@ def main():
         "HORAS_EXTRA AL 100",
         "HORAS_NOCTURNA",
         "TARDANZA",
-        "LLEGADA_ANTICIPADA"
+        "LLEGADA_ANTICIPADA",
+        "HORAS_EXTRA DOMINGO"
     ]
 
     for c in COLS_CERO_VACIO:
@@ -496,16 +399,7 @@ def main():
         EXPORTAR_DECIMAL=True,
         COLS_HORAS_DETALLE=[c for c in HORAS_A_VACIAR_DIA_ANTERIOR if c in df_export.columns],
     )
-    """
-    pintar_flags_si_no(
-        path_xlsx=out,
-        sheet_name="Detalle diario",
-        cols_flag=[
-            "Ausencia","Tardanza -","Trabajo Insuficiente","Es Feriado","Licencia",
-            "Cruce de día","Ajuste cruce→feriado"
-        ]
-    )
-     """
+
     #agregar_resumen_turnos(out)
     agregar_resumen_general(out)
 
